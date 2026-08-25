@@ -36,6 +36,7 @@ from verl_speco.integration.vllm_runtime import (
     _speco_npu_target_staging,
     _speco_npu_target_staging_decision,
     _speco_persistent_weight_shm_name,
+    _strip_speco_internal_speculative_keys,
     _validate_vllm_dflash_drafter_config,
     _vllm_ascend_has_dspark_pr11153_k_query_runtime,
     _vllm_spec_decode_stats_to_metrics,
@@ -580,6 +581,107 @@ def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(
     assert engine_kwargs["speculative_config"]["method"] == "dflash"
     assert engine_kwargs["speculative_config"]["num_speculative_tokens"] == 16
     assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
+
+
+def test_strip_speco_internal_speculative_keys_drops_draft_sample_method() -> None:
+    stripped = _strip_speco_internal_speculative_keys(
+        {
+            "method": "eagle3",
+            "num_speculative_tokens": 3,
+            "model": "/models/drafter",
+            "draft_sample_method": "greedy",
+        }
+    )
+
+    assert stripped == {
+        "method": "eagle3",
+        "num_speculative_tokens": 3,
+        "model": "/models/drafter",
+    }
+    assert "draft_sample_method" not in stripped
+
+
+def test_strip_speco_internal_speculative_keys_drops_probabilistic_override() -> None:
+    stripped = _strip_speco_internal_speculative_keys(
+        {
+            "method": "dspark",
+            "num_speculative_tokens": 16,
+            "draft_sample_method": "probabilistic",
+        }
+    )
+
+    assert "draft_sample_method" not in stripped
+    assert stripped["method"] == "dspark"
+
+
+def test_configure_vllm_runtime_strips_draft_sample_method_from_engine_kwargs(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
+        lambda: True,
+    )
+    config = {
+        "actor_rollout_ref": {
+            "rollout": {
+                "name": "vllm",
+                "drafter": _drafter(),
+                "engine_kwargs": {"vllm": {}},
+            }
+        }
+    }
+
+    configure_vllm_runtime_from_config(config)
+
+    spec = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"][
+        "speculative_config"
+    ]
+    # vLLM's SpeculativeConfig forbids extra fields; draft_sample_method is a
+    # SPECO-internal key and must not be forwarded to vLLM.
+    assert "draft_sample_method" not in spec
+    assert spec["method"] == "eagle3"
+    assert spec["num_speculative_tokens"] == 3
+
+
+def test_configure_vllm_runtime_strips_probabilistic_override_from_engine_kwargs(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint",
+        lambda: False,
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+    config = {
+        "actor_rollout_ref": {
+            "rollout": {
+                "name": "vllm",
+                "drafter": _drafter(
+                    speculative_algorithm="DSPARK",
+                    model_path=str(model_path),
+                    rollout={"spec_steps": 3, "spec_verify_tokens": 16},
+                    vllm={
+                        "speculative_config_overrides": {
+                            "draft_sample_method": "probabilistic"
+                        }
+                    },
+                ),
+                "engine_kwargs": {"vllm": {}},
+            }
+        }
+    }
+
+    configure_vllm_runtime_from_config(config)
+
+    spec = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"][
+        "speculative_config"
+    ]
+    assert "draft_sample_method" not in spec
+    assert spec["method"] == "dspark"
 
 
 def test_transformers_attention_layer_type_constants_compat(monkeypatch) -> None:

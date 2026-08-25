@@ -1122,6 +1122,38 @@ def _merge_speculative_config(
     return merged
 
 
+# Keys that SPECO injects into the speculative-decoding config for its own
+# bookkeeping (lossless-draft validation, diagnostics, test contracts) but
+# that are NOT valid vLLM ``SpeculativeConfig`` fields. vLLM builds that
+# dataclass with ``ConfigDict(extra="forbid")``, so forwarding an unknown key
+# such as ``draft_sample_method`` makes ``create_engine_config`` raise a
+# pydantic ``ValidationError`` during server launch. These keys must be
+# stripped at the boundary where the SPECO config is written into
+# ``engine_kwargs`` and handed to vLLM.
+_SPECO_INTERNAL_SPECULATIVE_CONFIG_KEYS = frozenset({"draft_sample_method"})
+
+
+def _strip_speco_internal_speculative_keys(config: Any) -> dict[str, Any]:
+    """Return a copy of ``config`` safe to forward to vLLM's SpeculativeConfig.
+
+    Removes SPECO-internal keys (see ``_SPECO_INTERNAL_SPECULATIVE_CONFIG_KEYS``)
+    that vLLM rejects. ``build_vllm_speculative_config_from_drafter`` is allowed
+    to keep these keys in its return value for SPECO bookkeeping and tests;
+    this helper is the gate that drops them before the dict crosses into
+    vLLM's domain. Non-dict inputs yield an empty dict.
+    """
+    if isinstance(config, str):
+        config = json.loads(config)
+    config = _plain_container(config)
+    if not isinstance(config, dict):
+        return {}
+    return {
+        key: value
+        for key, value in config.items()
+        if key not in _SPECO_INTERNAL_SPECULATIVE_CONFIG_KEYS
+    }
+
+
 def _int_or_zero(value: Any) -> int:
     try:
         return int(value)
@@ -1954,7 +1986,13 @@ def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
             )
         ),
     )
-    _set_child(engine_kwargs, "speculative_config", merged_speculative_config)
+    # Drop SPECO-internal keys (e.g. ``draft_sample_method``) before handing the
+    # config to vLLM: its SpeculativeConfig forbids extra fields and would
+    # otherwise raise a ValidationError during server launch.
+    vllm_speculative_config = _strip_speco_internal_speculative_keys(
+        merged_speculative_config
+    )
+    _set_child(engine_kwargs, "speculative_config", vllm_speculative_config)
     if bool(merged_speculative_config.get("enforce_eager")):
         _set_child(engine_kwargs, "enforce_eager", True)
 
@@ -2118,7 +2156,14 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
             )
         ),
     )
-    _set_child(engine_kwargs, "speculative_config", merged_speculative_config)
+    # Drop SPECO-internal keys (e.g. ``draft_sample_method``) before handing the
+    # config to vLLM: its SpeculativeConfig forbids extra fields and would
+    # otherwise raise a ValidationError during server launch. The full dict
+    # (with the SPECO key) is still returned to SPECO callers for bookkeeping.
+    vllm_speculative_config = _strip_speco_internal_speculative_keys(
+        merged_speculative_config
+    )
+    _set_child(engine_kwargs, "speculative_config", vllm_speculative_config)
     if bool(drafter_cfg.get("enable")):
         _set_child(
             engine_kwargs, "worker_extension_cls", SPECO_VLLM_WORKER_EXTENSION_CLS
