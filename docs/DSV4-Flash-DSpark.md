@@ -1,4 +1,4 @@
-# DeepSeek-V4-Flash DSpark 草稿模型实现技术报告
+# 基于 verl-SpeCo 框架的 DeepSeek-V4-Flash DSpark 草稿模型训练实现技术报告
 
 ## 1. 背景
 
@@ -24,7 +24,7 @@ DSpark 相比原 MTP-1 基线，V4-Flash 生成速度提升 **60%–85%**，V4-P
 
 ### 1.3 本报告范围
 
-本报告描述将 DSpark 草稿模型从 speculators 框架迁移到 verl-SpeCo 训练框架、在华为 Ascend 910 NPU 上实现训练和推理的完整方案。
+本报告描述在 verl-SpeCo 训练框架上实现DSV4-Flash DSpark草稿模型单独训练、并在 NPU 上实现训练和推理的完整实现。
 
 ### 1.4 验证环境
 
@@ -35,7 +35,6 @@ DSpark 相比原 MTP-1 基线，V4-Flash 生成速度提升 **60%–85%**，V4-P
 | NPU | Ascend 910, 8 卡 × 64GB HBM |
 | NPU 驱动 | 25.5.1 (V100R001C23SPC006B220) |
 | npu-smi | 25.5.1 |
-| 服务器 | A3-syn-48 (aarch64) |
 
 #### 1.4.2 软件环境
 
@@ -53,18 +52,11 @@ DSpark 相比原 MTP-1 基线，V4-Flash 生成速度提升 **60%–85%**，V4-P
 
 #### 1.4.3 模型 Checkpoint
 
-| Checkpoint | 路径 | 大小 | 格式 |
+| Checkpoint | 名称 | 大小 | 格式 |
 |-----------|------|------|------|
-| DSpark-BF16 | /home/model/DeepSeek-V4-Flash-DSpark-bf16 | 567GB (142 shards) | BF16, 3-aux |
-| DSpark-W8A8 | /home/model/DeepSeek-V4-Flash-DSpark-W8A8 | 282GB (71+68 shards) | W8A8 (int8+FP8), 3-aux |
-| 0731-BF16 | /home/model/DeepSeek-V4-Flash-0731-bf16 | — | BF16 (文档参考) |
-
-#### 1.4.4 数据集与 Feature Store
-
-| 数据 | 路径 | 说明 |
-|------|------|------|
-| GSM8K 中文 | /home/dataset/gsm8k/GSM8K_zh.json | 8792 samples, 有 `question`/`answer` 字段 |
-| Feature Store (W8A8 HS) | /tmp/dsv4_gsm8k_real_hs/ | 8 样本, 16384 dim, dflash_aux_plus_last |
+| DSpark-BF16 | DeepSeek-V4-Flash-DSpark-bf16 | 567GB (142 shards) | BF16, 3-aux |
+| DSpark-W8A8 | DeepSeek-V4-Flash-DSpark-W8A8 | 282GB (71+68 shards) | W8A8 (int8+FP8), 3-aux |
+| 0731-BF16 | DeepSeek-V4-Flash-0731-bf16 | — | BF16 (文档参考) |
 
 ---
 
@@ -654,10 +646,6 @@ DSpark 草稿模型有 256 路由专家 × 3 层 = 768 专家。单卡放不下�
 |------|--------|------|
 | 从 bf16 模型采集 HS（解除 W8A8 HS 不匹配） | P0 | bf16 模型 567GB 跨 8 卡加载方案 |
 | 禁用 W8A8 激活量化采 HS | P1 | vllm-ascend 修改 `npu_quant_matmul` → `F.linear` |
-| 生成 100+ 训练样本 | P1 | P0 完成 |
-| 训练 100+ 步验证 acceptance rate | P2 | P1 完成 |
-| 8 卡 HCCL EI0015 排查 | P2 | 网络配置/HCCL rootInfo 排查 |
-| vllm-ascend PR 提交 | P2 | 3 处源码修复 |
 
 ### 7.3 verl-SpeCo 源码修改详细记录
 
