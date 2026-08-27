@@ -68,6 +68,7 @@ _DSPARK_VLLM_ARCHITECTURES = {
     "DSparkDraftModel",
     "Qwen3DSparkModel",
     "DeepSeekDSparkModel",
+    "DSV4DSparkDraftModel",
 }
 _TRANSFORMERS_ATTENTION_LAYER_TYPES_FALLBACK = (
     "attention",
@@ -832,7 +833,7 @@ def _validate_vllm_dflash_drafter_config(
 
     architectures = config.get("architectures") or []
     algorithm = str(algorithm or "DFLASH").strip().upper()
-    if algorithm == "DSPARK":
+    if algorithm in ("DSPARK", "DSV4_DSPARK"):
         if not _is_dspark_config(config):
             raise ValueError(
                 "vLLM DSpark uses the DFlash speculative path, but requires "
@@ -909,7 +910,7 @@ def _speculative_method_from_drafter(drafter_cfg: dict[str, Any]) -> str:
             "enables the Domino correction head on engines that support it, keeping DOMINO for "
             "drafter training."
         )
-    if algorithm == "DSPARK":
+    if algorithm in ("DSPARK", "DSV4_DSPARK"):
         return "dflash" if _is_vllm_ascend_runtime_hint() else "dspark"
 
     method_map = {
@@ -1035,7 +1036,7 @@ def build_vllm_speculative_config_from_drafter(
 
     rollout_drafter_cfg = drafter_cfg.get("rollout") or {}
     if method in ("dflash", "dspark"):
-        if method == "dflash" or algorithm == "DSPARK":
+        if method == "dflash" or algorithm in ("DSPARK", "DSV4_DSPARK"):
             _validate_vllm_dflash_drafter_config(spec_model_path, algorithm=algorithm)
         num_speculative_tokens = _positive_int_or_none(
             rollout_drafter_cfg.get("spec_verify_tokens")
@@ -1063,8 +1064,17 @@ def build_vllm_speculative_config_from_drafter(
     speculative_config: dict[str, Any] = {
         "method": method,
         "num_speculative_tokens": num_speculative_tokens,
-        "draft_sample_method": "greedy",
     }
+    try:
+        from vllm.config import SpeculativeConfig as _VllmSpecConfig
+
+        _supports_dsm = "draft_sample_method" in getattr(
+            _VllmSpecConfig, "__dataclass_fields__", {}
+        )
+    except Exception:
+        _supports_dsm = False
+    if _supports_dsm:
+        speculative_config["draft_sample_method"] = "greedy"
     if spec_model_path is not None:
         speculative_config["model"] = spec_model_path
 
@@ -1120,38 +1130,6 @@ def _merge_speculative_config(
     merged = dict(injected)
     merged.update(existing)
     return merged
-
-
-# Keys that SPECO injects into the speculative-decoding config for its own
-# bookkeeping (lossless-draft validation, diagnostics, test contracts) but
-# that are NOT valid vLLM ``SpeculativeConfig`` fields. vLLM builds that
-# dataclass with ``ConfigDict(extra="forbid")``, so forwarding an unknown key
-# such as ``draft_sample_method`` makes ``create_engine_config`` raise a
-# pydantic ``ValidationError`` during server launch. These keys must be
-# stripped at the boundary where the SPECO config is written into
-# ``engine_kwargs`` and handed to vLLM.
-_SPECO_INTERNAL_SPECULATIVE_CONFIG_KEYS = frozenset({"draft_sample_method"})
-
-
-def _strip_speco_internal_speculative_keys(config: Any) -> dict[str, Any]:
-    """Return a copy of ``config`` safe to forward to vLLM's SpeculativeConfig.
-
-    Removes SPECO-internal keys (see ``_SPECO_INTERNAL_SPECULATIVE_CONFIG_KEYS``)
-    that vLLM rejects. ``build_vllm_speculative_config_from_drafter`` is allowed
-    to keep these keys in its return value for SPECO bookkeeping and tests;
-    this helper is the gate that drops them before the dict crosses into
-    vLLM's domain. Non-dict inputs yield an empty dict.
-    """
-    if isinstance(config, str):
-        config = json.loads(config)
-    config = _plain_container(config)
-    if not isinstance(config, dict):
-        return {}
-    return {
-        key: value
-        for key, value in config.items()
-        if key not in _SPECO_INTERNAL_SPECULATIVE_CONFIG_KEYS
-    }
 
 
 def _int_or_zero(value: Any) -> int:
@@ -1986,13 +1964,7 @@ def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
             )
         ),
     )
-    # Drop SPECO-internal keys (e.g. ``draft_sample_method``) before handing the
-    # config to vLLM: its SpeculativeConfig forbids extra fields and would
-    # otherwise raise a ValidationError during server launch.
-    vllm_speculative_config = _strip_speco_internal_speculative_keys(
-        merged_speculative_config
-    )
-    _set_child(engine_kwargs, "speculative_config", vllm_speculative_config)
+    _set_child(engine_kwargs, "speculative_config", merged_speculative_config)
     if bool(merged_speculative_config.get("enforce_eager")):
         _set_child(engine_kwargs, "enforce_eager", True)
 
@@ -2156,14 +2128,7 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
             )
         ),
     )
-    # Drop SPECO-internal keys (e.g. ``draft_sample_method``) before handing the
-    # config to vLLM: its SpeculativeConfig forbids extra fields and would
-    # otherwise raise a ValidationError during server launch. The full dict
-    # (with the SPECO key) is still returned to SPECO callers for bookkeeping.
-    vllm_speculative_config = _strip_speco_internal_speculative_keys(
-        merged_speculative_config
-    )
-    _set_child(engine_kwargs, "speculative_config", vllm_speculative_config)
+    _set_child(engine_kwargs, "speculative_config", merged_speculative_config)
     if bool(drafter_cfg.get("enable")):
         _set_child(
             engine_kwargs, "worker_extension_cls", SPECO_VLLM_WORKER_EXTENSION_CLS
@@ -2858,7 +2823,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             )
             inner_model.load_weights(iter(translated_weights))
 
-            # Rebuild fused KV buffers (torch.cat snapshot, not a view).
+            # Rebuild fused KV buffers (torch.cat snapshot, not a view)
             try:
                 self._speco_rebuild_draft_metadata_buffers(draft_model)
             except Exception as exc:

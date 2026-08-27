@@ -820,14 +820,31 @@ class DrafterBaseTrainer:
         return getattr(self.backend, "model_type", None) in {
             "dflash",
             "dspark",
+            "dsv4_dspark",
             "domino",
         }
 
     def _block_drafter_metric_prefix(self) -> str:
         model_type = str(getattr(self.backend, "model_type", "dflash") or "dflash")
-        if model_type in {"dspark", "domino"}:
+        if model_type in {"dspark", "dsv4_dspark", "domino"}:
             return model_type
         return "dflash"
+
+    def _is_ep_enabled(self) -> bool:
+        from verl_speco.backends.dsv4_ep_utils import is_ep_enabled
+        return is_ep_enabled(self.config)
+
+    def _apply_ep_only(self, raw_model, use_skip_loading):
+        from verl_speco.backends.dsv4_ep_utils import apply_ep_only
+        apply_ep_only(self, raw_model, use_skip_loading)
+
+    def _apply_ep_fsdp2(self, raw_model, fsdp_kwargs, fsdp_config, use_skip_loading):
+        from verl_speco.backends.dsv4_ep_utils import apply_ep_fsdp2
+        apply_ep_fsdp2(self, raw_model, fsdp_kwargs, fsdp_config, use_skip_loading)
+
+    def _sync_non_expert_grads(self):
+        from verl_speco.backends.dsv4_ep_utils import sync_non_expert_grads
+        sync_non_expert_grads(self)
 
     def _block_drafter_config_value(self, suffix: str, default: Any) -> Any:
         training_cfg = self.config.rollout.drafter.training
@@ -1049,7 +1066,7 @@ class DrafterBaseTrainer:
         pending_target_weight = self._pending_target_lm_head_weight
         if (
             getattr(self.backend, "model_type", None)
-            in {"eagle3", "dflash", "dspark", "domino"}
+            in {"eagle3", "dflash", "dspark", "dsv4_dspark", "domino"}
             and torch.is_tensor(pending_target_weight)
             and pending_target_weight.dim() == 2
         ):
@@ -1060,8 +1077,30 @@ class DrafterBaseTrainer:
             )
         else:
             setattr(self.backend, "_initial_target_lm_head_shape", None)
+
+        init_on_meta = bool(self.config.rollout.drafter.training.get("init_on_meta", False))
+        random_init = bool(self.config.rollout.drafter.training.get("dsv4_dspark_random_init", False))
+        use_skip_loading = (
+            dist.is_initialized() and dist.get_world_size() > 1
+            and (random_init or (init_on_meta and dist.get_rank() != 0))
+        )
+
+        if self._is_ep_enabled() and dist.is_initialized() and dist.get_world_size() > 1:
+            n_experts = int(self.config.rollout.drafter.training.get(
+                "dsv4_dspark_backbone_n_routed_experts", 256))
+            world_size = dist.get_world_size()
+            from verl_speco.models.dsv4_dspark.backbone import moe_ep
+            moe_ep.configure(group=dist.group.WORLD, rank=dist.get_rank(),
+                             size=world_size, experts_per_rank=n_experts // world_size)
+            moe_ep.enable()
+
+        if use_skip_loading:
+            self.backend._skip_weight_loading = True
         raw_model, drafter_model_config = self.backend.build_model()
-        raw_model.to(self.runtime_device)
+        if use_skip_loading:
+            delattr(self.backend, "_skip_weight_loading")
+        if not self._is_ep_enabled():
+            raw_model.to(self.runtime_device)
 
         # B. 获取全量状态用于 FSDP 初始化
 
@@ -1079,17 +1118,24 @@ class DrafterBaseTrainer:
                 "mp_policy": mp_policy,
                 "offload_policy": None,
             }
-            logger.debug("Building drafter model with its configured FSDP2 mesh")
+            logger.debug("Building drafter model with mesh-centered dp x sp FSDP2")
 
-            full_state = raw_model.state_dict()
-            apply_fsdp2(raw_model, fsdp_kwargs, fsdp_config)
-
-            # Load full state dict using the same mesh as used by drafter FSDP wrapping
-            fsdp2_load_full_state_dict(
-                raw_model, full_state, self.fsdp_device_mesh, None
-            )
+            ep_enabled = self._is_ep_enabled()
+            ep_no_fsdp = bool(self.config.rollout.drafter.training.get("dsv4_dspark_ep_no_fsdp", False))
+            if ep_enabled and ep_no_fsdp:
+                self._apply_ep_only(raw_model, use_skip_loading)
+            elif ep_enabled:
+                ep_mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+                self._apply_ep_fsdp2(raw_model, {"mesh": self.fsdp_device_mesh,
+                    "mp_policy": ep_mp, "offload_policy": None}, fsdp_config, use_skip_loading)
+            else:
+                full_state = raw_model.state_dict() if not use_skip_loading else {}
+                if use_skip_loading and not full_state:
+                    full_state = raw_model.state_dict() if dist.get_rank() == 0 else {}
+                apply_fsdp2(raw_model, fsdp_kwargs, fsdp_config)
+                fsdp2_load_full_state_dict(raw_model, full_state, self.fsdp_device_mesh, None)
+                del full_state
             self.model = raw_model
-            del full_state
         elif (
             self.training_process_group is not None
             and self.training_group_world_size > 1
@@ -3647,7 +3693,7 @@ class DrafterBaseTrainer:
         position_list = preprocessed_lists.get("position_ids")
         target_last_h_list = preprocessed_lists.get("target_last_h_states")
         dspark_l1_enabled = (
-            self.backend.model_type == "dspark"
+            self.backend.model_type in ("dspark", "dsv4_dspark")
             and float(
                 self.config.rollout.drafter.training.get("dspark_l1_loss_alpha", 0.9)
                 or 0.0
@@ -4163,7 +4209,7 @@ class DrafterBaseTrainer:
                 dtype=torch.long,
                 device=dev,
             )
-        elif self.backend.model_type == "dspark" and target_last_hidden_state_chunks:
+        elif self.backend.model_type in ("dspark", "dsv4_dspark") and target_last_hidden_state_chunks:
             batch["target_last_hidden_states"] = target_last_hidden_states
 
         batch = self._sanitize_training_batch(batch)
@@ -4185,7 +4231,7 @@ class DrafterBaseTrainer:
             peagle_last_hidden_states = batch["last_hidden_states"]
             peagle_seq_lengths = batch["seq_lengths"]
         elif (
-            self.backend.model_type == "dspark" and "target_last_hidden_states" in batch
+            self.backend.model_type in ("dspark", "dsv4_dspark") and "target_last_hidden_states" in batch
         ):
             target_last_hidden_states = batch["target_last_hidden_states"]
 
@@ -4227,7 +4273,7 @@ class DrafterBaseTrainer:
                             last_hidden_states, (0, 0, 0, pad_size), value=0.0
                         )
                 elif (
-                    self.backend.model_type == "dspark"
+                    self.backend.model_type in ("dspark", "dsv4_dspark")
                     and "target_last_hidden_states" in batch
                 ):
                     target_last_hidden_states = torch.nn.functional.pad(
@@ -4248,7 +4294,7 @@ class DrafterBaseTrainer:
                         last_hidden_states, dim=1, padding=False
                     )
             elif (
-                self.backend.model_type == "dspark"
+                self.backend.model_type in ("dspark", "dsv4_dspark")
                 and "target_last_hidden_states" in batch
             ):
                 target_last_hidden_states = slice_input_tensor(
@@ -4276,7 +4322,7 @@ class DrafterBaseTrainer:
         elif self.backend.model_type == "peagle":
             batch["last_hidden_states"] = peagle_last_hidden_states
             batch["seq_lengths"] = peagle_seq_lengths
-        elif self.backend.model_type == "dspark" and target_last_hidden_state_chunks:
+        elif self.backend.model_type in ("dspark", "dsv4_dspark") and target_last_hidden_state_chunks:
             batch["target_last_hidden_states"] = target_last_hidden_states
         batch["_speco_pad_size"] = pad_size_for_batch
 
@@ -4654,6 +4700,8 @@ class DrafterBaseTrainer:
         )
         backward_ts = time.time()
         local_loss.backward()
+        if self._is_ep_enabled():
+            self._sync_non_expert_grads()
         self.record_training_timing(
             "timing_s/drafter_backward", time.time() - backward_ts
         )
@@ -5053,11 +5101,13 @@ class DrafterBaseTrainer:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Pending full drafter checkpoint save failed: {e}")
             self._pending_full_checkpoint_future = None
+
         if self.optimizer is not None:
             try:
                 self.optimizer.zero_grad(set_to_none=True)
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to clear drafter gradients during cleanup: {e}")
+
         if self.skip_heavy_cleanup_after_drafter_training:
             if clear_data:
                 self.collected_data.clear()
@@ -5072,9 +5122,70 @@ class DrafterBaseTrainer:
             )
             return
 
-        # Training and publish collectives have completed before cleanup. These
-        # process groups stay alive across triggers, so barriers here only
-        # serialize ranks and can add timeout windows without releasing memory.
+        # Barriers: skip for VeOmni NPU (process groups stay alive across
+        # triggers; barriers only serialize ranks and add timeout windows
+        # without releasing memory).
+        if not self._use_blocking_npu_optimizer_offload():
+            sp_group = self._get_sp_group()
+            dp_group = self._get_dp_group()
+            if sp_group is not None and self._get_sp_world_size() > 1:
+                try:
+                    await asyncio.sleep(0.1)
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.get_event_loop().run_in_executor(
+                                None, lambda: torch.distributed.barrier(sp_group)
+                            ),
+                            timeout=5.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"Rank {self.rank} subgroup barrier timeout during cleanup, continuing anyway"
+                        )
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.debug(f"Subgroup cleanup error (expected): {e}")
+            if dp_group is not None and self._get_dp_world_size() > 1:
+                try:
+                    await asyncio.sleep(0.1)
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.get_event_loop().run_in_executor(
+                                None, lambda: torch.distributed.barrier(dp_group)
+                            ),
+                            timeout=5.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"Rank {self.rank} dp-group barrier timeout during cleanup, continuing anyway"
+                        )
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.debug(f"DP-group cleanup error (expected): {e}")
+            elif self.training_device_mesh is not None:
+                try:
+                    await asyncio.sleep(0.1)
+                    if self.training_device_mesh.size() > 1:
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.get_event_loop().run_in_executor(
+                                    None,
+                                    lambda: torch.distributed.barrier(
+                                        self.training_device_mesh.get_group()
+                                    ),
+                                ),
+                                timeout=5.0,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                f"Rank {self.rank} barrier timeout during cleanup, continuing anyway"
+                            )
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.debug(f"Process group cleanup error (expected): {e}")
 
         if self.model is not None:
             try:

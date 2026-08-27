@@ -118,6 +118,11 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 step=optimizer_step,
             )
             has_batch = batch is not None
+            if not has_batch and rank == 0 and attempted_batches <= 3:
+                logger.warning(
+                    "Batch is None: samples=%d step=%d collected=%d",
+                    len(samples), optimizer_step, len(trainer.collected_data),
+                )
             if not _all_ranks_true(has_batch, trainer.runtime_device):
                 if rank == 0:
                     logger.warning(
@@ -324,6 +329,47 @@ _VARIANT_RUNTIME_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
             "mask_token_id",
         ),
     ),
+    "dsv4_dspark": (
+        "dsv4_dspark_config",
+        (
+            "block_size",
+            "num_anchors",
+            "markov_rank",
+            "markov_head_type",
+            "confidence_head_alpha",
+            "confidence_head_with_markov",
+            "ce_loss_alpha",
+            "l1_loss_alpha",
+            "loss_decay_gamma",
+            "target_layer_ids",
+            "num_context_layers",
+            "num_target_layers",
+            "target_num_hidden_layers",
+            "mask_token_id",
+            "dsv4_num_heads",
+            "dsv4_head_dim",
+            "dsv4_rope_head_dim",
+            "dsv4_q_lora_rank",
+            "dsv4_o_lora_rank",
+            "dsv4_o_groups",
+            "dsv4_window_size",
+            "dsv4_rope_theta",
+            "dsv4_rope_factor",
+            "dsv4_original_seq_len",
+            "dsv4_beta_fast",
+            "dsv4_beta_slow",
+            "dsv4_n_routed_experts",
+            "dsv4_n_shared_experts",
+            "dsv4_n_activated_experts",
+            "dsv4_moe_inter_dim",
+            "dsv4_score_func",
+            "dsv4_route_scale",
+            "dsv4_swiglu_limit",
+            "dsv4_hc_mult",
+            "dsv4_hc_sinkhorn_iters",
+            "dsv4_hc_eps",
+        ),
+    ),
 }
 
 
@@ -339,7 +385,7 @@ def _rewrite_standalone_block_runtime_config(
     contract and only merge the alias fields needed by vLLM/SGLang.
     """
     backend_type = getattr(getattr(trainer, "backend", None), "model_type", None)
-    if backend_type not in {"dflash", "dspark", "domino"}:
+    if backend_type not in {"dflash", "dspark", "dsv4_dspark", "domino"}:
         return
 
     if completed_future is not None:
@@ -495,6 +541,10 @@ def _configure_device(local_rank: int) -> None:
     device_name = get_device_name()
     device_module = get_torch_device()
     if device_name == "cpu":
+        return
+    if device_name == "npu":
+        import torch_npu
+        torch_npu.npu.set_device(int(local_rank))
         return
     set_device = getattr(device_module, "set_device", None)
     if callable(set_device):

@@ -174,7 +174,7 @@ def _drafter_uses_dflash_aux_hidden(drafter_cfg: dict[str, Any]) -> bool:
     algorithm = str(drafter_cfg.get("speculative_algorithm", "") or "").upper()
     training_cfg = drafter_cfg.get("training") or {}
     return bool(
-        algorithm in {"DFLASH", "DSPARK"}
+        algorithm in {"DFLASH", "DSPARK", "DSV4_DSPARK"}
         and drafter_cfg.get("enable")
         and drafter_cfg.get("enable_drafter_training")
         and training_cfg.get("collect_hidden_states_from_sgl")
@@ -1331,7 +1331,7 @@ class _SpecoSGLangHttpServerMixin:
                 str(drafter_cfg.get("speculative_algorithm", "") or "").strip().upper()
             )
             max_window_key = (
-                "dspark_max_window" if algorithm == "DSPARK" else "dflash_max_window"
+                "dspark_max_window" if algorithm in ("DSPARK", "DSV4_DSPARK") else "dflash_max_window"
             )
             dflash_max_window = _positive_int_or_none(
                 training_cfg.get(max_window_key, training_cfg.get("dflash_max_window"))

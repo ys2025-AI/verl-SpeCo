@@ -21,6 +21,7 @@ participate in draft model training.
 from __future__ import annotations
 
 import logging
+import os
 
 import hydra
 
@@ -31,6 +32,17 @@ from verl_speco.trainer.draft_training_loop import (
 
 
 logger = logging.getLogger(__name__)
+
+# Set NPU device BEFORE any torch operation.
+# torchrun assigns LOCAL_RANK to each process; without explicit set_device,
+# all ranks default to device 0, causing HCCL EI0015 "same physical device ID".
+_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+try:
+    import torch_npu
+    torch_npu.npu.set_device(_local_rank)
+    print(f"[draft_train] LOCAL_RANK={_local_rank} device={torch_npu.npu.current_device()}", flush=True)
+except ImportError:
+    pass
 
 
 @hydra.main(config_path="config", config_name="draft_trainer", version_base=None)

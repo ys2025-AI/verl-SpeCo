@@ -58,6 +58,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         sampled_ce_negatives: int = 0,
         ce_loss_alpha: float = 0.1,
         l1_loss_alpha: float = 0.9,
+        tv_loss_alpha: float = 0.0,
         confidence_head_alpha: float = 0.0,
         l1_chunk_size: int = 0,
         debug_log: bool = False,
@@ -76,6 +77,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         )
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.l1_loss_alpha = float(l1_loss_alpha)
+        self.tv_loss_alpha = float(tv_loss_alpha)
         self.confidence_head_alpha = float(confidence_head_alpha)
         self.l1_chunk_size = int(l1_chunk_size or 0)
         if self.confidence_head_alpha > 0:
@@ -539,7 +541,23 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 l1_loss = local_l1_sum / local_l1_den.clamp(min=1e-6)
             else:
                 l1_loss = local_ploss_sum.new_zeros(())
-            loss = (ce_loss * self.ce_loss_alpha) + (l1_loss * self.l1_loss_alpha)
+            tv_loss = local_ploss_sum.new_zeros(())
+            if self.tv_loss_alpha > 0 and active_target_hidden is not None:
+                _tv_chunk = self.l1_chunk_size if self.l1_chunk_size > 0 else active_logits.size(0)
+                local_tv_sum = local_ploss_sum.new_zeros((), dtype=torch.float32)
+                local_tv_den = active_loss_weights.sum().clamp(min=1e-6)
+                for _s in range(0, active_logits.size(0), _tv_chunk):
+                    _e = min(_s + _tv_chunk, active_logits.size(0))
+                    with torch.no_grad():
+                        _t_logits = F.linear(active_target_hidden[_s:_e].float(), lm_head_weight.float())
+                    _d_p = F.softmax(active_logits[_s:_e].float(), dim=-1)
+                    _t_p = F.softmax(_t_logits, dim=-1)
+                    _ov = torch.minimum(_d_p, _t_p).sum(dim=-1)
+                    _tv_tok = 1.0 - _ov
+                    _tv_tok = torch.where(finite_loss[_s:_e], _tv_tok, torch.zeros_like(_tv_tok))
+                    local_tv_sum = local_tv_sum + (_tv_tok * active_loss_weights[_s:_e]).sum()
+                tv_loss = local_tv_sum / local_tv_den
+            loss = (ce_loss * self.ce_loss_alpha) + (l1_loss * self.l1_loss_alpha) + (tv_loss * self.tv_loss_alpha)
 
         with torch.no_grad():
             flat_eval_mask = eval_mask.reshape(-1)

@@ -68,6 +68,7 @@ actor_rollout_ref:
         max_seq_len: 8192
         step: 10
         batch_size_per_gpu: 4
+        init_on_meta: false
         training_interval_steps: 5
         publish_interval_steps: 0
         publish_async: false
@@ -86,9 +87,9 @@ actor_rollout_ref:
         train_batches_per_cycle: 4
         lr: 1e-5
         lr_warmup_steps: 0
-        lr_scheduler_type: constant
+        lr_scheduler_type: cosine
         lr_decay_steps: 100
-        min_lr_ratio: 0.1
+        min_lr_ratio: 0.0
         warmup_style: null
         resume_trainer_state_from_checkpoint: true
         use_logits: false
@@ -137,6 +138,59 @@ actor_rollout_ref:
         dspark_debug_log: false
         dspark_debug_log_first_n: 2
         dspark_debug_log_interval: 100
+        # DSV4-Flash DSpark (DeepSeek-V4-Flash sparse backbone: MLA + sink + MoE + mHC).
+        # Unset keys fall back to the matching dspark_* value where applicable.
+        dsv4_dspark_block_size: 7
+        dsv4_dspark_num_anchors: 512
+        dsv4_dspark_loss_decay_gamma: 7.0
+        dsv4_dspark_hard_sample_ratio: 0.0
+        dsv4_dspark_hidden_size: null
+        dsv4_dspark_weight_dtype: bfloat16  # target dtype for dequantized weights: bfloat16|float16|float32|int8
+        dsv4_dspark_num_target_layers: 3
+        dsv4_dspark_num_hidden_layers: 3
+        dsv4_dspark_mask_token_id: null
+        dsv4_dspark_target_layer_ids: null
+        dsv4_dspark_max_window: 512
+        dsv4_dspark_loss_mode: full_vocab
+        dsv4_dspark_sampled_ce_negatives: 0
+        dsv4_dspark_markov_rank: 256
+        dsv4_dspark_markov_head_type: vanilla
+        dsv4_dspark_confidence_head_alpha: 0.0
+        dsv4_dspark_confidence_loss_alpha: 0.0
+        dsv4_dspark_confidence_head_with_markov: true
+        dsv4_dspark_ce_loss_alpha: 0.1
+        dsv4_dspark_l1_loss_alpha: 0.0
+        dsv4_dspark_tv_loss_alpha: 0.0  # requires target_last_hidden_states in HS data
+        dsv4_dspark_l1_chunk_size: 0
+        dsv4_dspark_debug_log: false
+        dsv4_dspark_debug_log_first_n: 2
+        dsv4_dspark_debug_log_interval: 100
+        # DSV4 backbone hyperparameters (mirror the released config).
+        dsv4_dspark_backbone_num_heads: 64
+        dsv4_dspark_backbone_head_dim: 512
+        dsv4_dspark_backbone_rope_head_dim: 64
+        dsv4_dspark_backbone_q_lora_rank: 1024
+        dsv4_dspark_backbone_o_lora_rank: 1024
+        dsv4_dspark_backbone_o_groups: 8
+        dsv4_dspark_backbone_window_size: 128
+        dsv4_dspark_backbone_rope_theta: 10000.0
+        dsv4_dspark_backbone_rope_factor: 16.0
+        dsv4_dspark_backbone_original_seq_len: 65536
+        dsv4_dspark_backbone_beta_fast: 32.0
+        dsv4_dspark_backbone_beta_slow: 1.0
+        dsv4_dspark_backbone_n_routed_experts: 256
+        dsv4_dspark_backbone_n_shared_experts: 1
+        dsv4_dspark_backbone_n_activated_experts: 6
+        dsv4_dspark_backbone_moe_inter_dim: 2048
+        dsv4_dspark_backbone_score_func: sqrtsoftplus
+        dsv4_dspark_backbone_route_scale: 1.5
+        dsv4_dspark_backbone_swiglu_limit: 10.0
+        dsv4_dspark_backbone_hc_mult: 4
+        dsv4_dspark_backbone_hc_sinkhorn_iters: 20
+        dsv4_dspark_backbone_hc_eps: 1.0e-6
+        # NPU accelerator kernels (opt-in, require distributed training for EP).
+        dsv4_dspark_enable_ep: false
+        dsv4_dspark_enable_grouped_gemm: false
         # P-EAGLE (parallel drafting: COD-subsampled multi-depth forward + KL loss).
         peagle_num_draft_layers: 4
         peagle_num_aux_hidden_states: 3
