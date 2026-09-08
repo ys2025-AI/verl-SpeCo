@@ -167,3 +167,52 @@ def test_run_bypass_propagates_training_without_rollout_error(monkeypatch) -> No
         match="enable_drafter_training=true requires drafter.enable=true",
     ):
         run(_config(enable=False, training=True))
+
+
+def test_run_bypass_strips_speco_overlay_before_native_run(monkeypatch) -> None:
+    pytest.importorskip("verl", reason="dispatch contract needs verl")
+    pytest.importorskip("ray", reason="dispatch contract needs ray")
+    from omegaconf import OmegaConf
+
+    import verl.trainer.main_ppo as main_ppo
+    import verl.utils.device as device
+    import verl_speco.integration.compat as compat
+
+    seen: list = []
+
+    def fake_run_ppo(config, task_runner_class=None):
+        seen.append(config)
+
+    monkeypatch.setattr(main_ppo, "run_ppo", fake_run_ppo)
+    monkeypatch.setattr(device, "auto_set_device", lambda config: None)
+    monkeypatch.setattr(compat, "check_compatible_verl", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        main_ppo, "migrate_legacy_reward_impl", None, raising=False
+    )
+
+    from verl_speco.main import run
+
+    config = OmegaConf.create(
+        {
+            "speco": {"bypass_when_drafter_disabled": True},
+            "actor_rollout_ref": {
+                "rollout": {
+                    "name": "vllm",
+                    "n": 1,
+                    "drafter": {"enable": False, "enable_drafter_training": False},
+                }
+            },
+        }
+    )
+
+    run(config)
+
+    assert len(seen) == 1
+    native_config = seen[0]
+    # The speco_base drafter overlay is rejected by verl's RolloutConfig, so
+    # the bypass must drop it (and the top-level speco block) before run_ppo.
+    assert "drafter" not in native_config.actor_rollout_ref.rollout
+    assert "speco" not in native_config
+    # The strip must be surgical: native rollout keys stay intact.
+    assert native_config.actor_rollout_ref.rollout.name == "vllm"
+    assert native_config.actor_rollout_ref.rollout.n == 1

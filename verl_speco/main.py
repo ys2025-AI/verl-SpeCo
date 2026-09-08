@@ -73,6 +73,25 @@ def should_bypass_speco(config) -> bool:
     return bool(bypass) and not rollout_enabled and not training_enabled
 
 
+def _strip_speco_overlay_for_native_run(config) -> None:
+    """Drop SPECO-only config keys so verl's native ``run_ppo`` accepts it.
+
+    The bypass path hands the config to verl directly. verl instantiates its
+    ``RolloutConfig`` from ``actor_rollout_ref.rollout`` and rejects the
+    speco_base ``drafter`` overlay; the top-level ``speco`` block is also
+    SPECO-only. Removing both keeps the native run free of SPECO config.
+    """
+
+    from omegaconf import OmegaConf, open_dict
+
+    with open_dict(config):
+        rollout = _config_get(config, "actor_rollout_ref", "rollout")
+        if OmegaConf.is_config(rollout) and "drafter" in rollout:
+            del rollout["drafter"]
+        if OmegaConf.is_config(config) and "speco" in config:
+            del config["speco"]
+
+
 def run(config) -> None:
     """Resolve SPECO/verl compatibility, device and the task-runner dispatch."""
 
@@ -93,6 +112,7 @@ def run(config) -> None:
         # Native verl path: keep SPECO runtime/compat patches unloaded so the
         # actor -> rollout weight sync matches verl exactly.  verl selects its
         # own TaskRunner (legacy on 0.8, legacy or V1 on 0.9).
+        _strip_speco_overlay_for_native_run(config)
         main_ppo.run_ppo(config)
         return
 
