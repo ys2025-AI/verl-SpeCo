@@ -65,6 +65,25 @@ def test_native_draft_update_available_requires_full_capability() -> None:
     assert ndu.native_draft_update_available(_full_native_rollout()) is True
 
 
+def test_stock_verl_rollout_adapter_lacks_native_draft_update_api() -> None:
+    """Stock verl ServerAdapter does not expose the native draft-update session.
+
+    Documents that on verl 0.8/0.9 the rollout adapter has ``update_weights``
+    (actor session) but lacks ``start_draft_weight_update`` etc.  Therefore
+    ``auto`` correctly falls back to ``compat`` and ``native`` correctly
+    fails fast.  The native path is provisioned for future vLLM V1 backends
+    or runtime injection that expose these APIs.
+    """
+    pytest.importorskip("verl", reason="stock adapter contract needs verl")
+    from verl.workers.rollout.vllm_rollout.vllm_rollout import ServerAdapter
+
+    adapter = ServerAdapter.__new__(ServerAdapter)
+    assert callable(getattr(adapter, "update_weights", None))  # actor API exists
+    assert not callable(getattr(adapter, "start_draft_weight_update", None))
+    assert not callable(getattr(adapter, "finish_weight_update", None))
+    assert ndu.native_draft_update_available(adapter) is False
+
+
 def test_select_compat_mode_forces_compat_path() -> None:
     decision = ndu.select_draft_update_strategy(
         _config("compat"), _full_native_rollout()

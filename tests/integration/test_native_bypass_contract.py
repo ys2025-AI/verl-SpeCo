@@ -29,11 +29,9 @@ omegaconf = pytest.importorskip("omegaconf", reason="bypass contract needs omega
 OmegaConf = omegaconf.OmegaConf
 
 
-def _config(*, enable=False, training=False, bypass=None) -> object:
-    speco = {} if bypass is None else {"bypass_when_drafter_disabled": bypass}
+def _config(*, enable=False, training=False) -> object:
     return OmegaConf.create(
         {
-            "speco": speco,
             "actor_rollout_ref": {
                 "rollout": {
                     "drafter": {
@@ -72,12 +70,6 @@ def test_should_bypass_rejects_training_without_rollout() -> None:
         match="enable_drafter_training=true requires drafter.enable=true",
     ):
         should_bypass_speco(_config(enable=False, training=True))
-
-
-def test_should_bypass_false_when_bypass_flag_disabled() -> None:
-    from verl_speco.main import should_bypass_speco
-
-    assert should_bypass_speco(_config(bypass=False)) is False
 
 
 def test_should_bypass_defaults_true_when_speco_block_missing() -> None:
@@ -194,7 +186,7 @@ def test_run_bypass_strips_speco_overlay_before_native_run(monkeypatch) -> None:
 
     config = OmegaConf.create(
         {
-            "speco": {"bypass_when_drafter_disabled": True},
+            "speco": {"enable": True},
             "actor_rollout_ref": {
                 "rollout": {
                     "name": "vllm",

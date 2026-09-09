@@ -40,10 +40,10 @@ def _config_get(config, *path, default=None):
 def should_bypass_speco(config) -> bool:
     """Return whether the run should skip SPECO and use verl's native path.
 
-    A run bypasses SPECO when the drafter is disabled for both rollout and
-    training and ``speco.bypass_when_drafter_disabled`` is true (the default).
-    Requesting drafter training without enabling rollout is rejected so the
-    bypass never hides an inconsistent configuration.
+    A run always bypasses SPECO when the drafter is disabled for both rollout
+    and training, so the actor -> rollout weight-sync path matches upstream
+    verl exactly.  Requesting drafter training without enabling rollout is
+    rejected so the bypass never hides an inconsistent configuration.
     """
 
     rollout_enabled = bool(
@@ -69,8 +69,7 @@ def should_bypass_speco(config) -> bool:
     if training_enabled and not rollout_enabled:
         raise ValueError("enable_drafter_training=true requires drafter.enable=true")
 
-    bypass = _config_get(config, "speco", "bypass_when_drafter_disabled", default=True)
-    return bool(bypass) and not rollout_enabled and not training_enabled
+    return not rollout_enabled and not training_enabled
 
 
 def _strip_speco_overlay_for_native_run(config) -> None:
