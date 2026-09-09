@@ -2551,18 +2551,17 @@ def attach_update_draft_weights_to_rollout(rollout: Any) -> Any:
 
 
 def patch_vllm_server_adapter_update() -> None:
+    """Install SPECO vLLM weight-transfer IPC patches.
+
+    The compat ``update_draft_weights`` method is **not** injected here.  It
+    is attached per-instance by ``attach_draft_weight_updater`` only after
+    ``select_draft_update_strategy`` selects the compat path, so the
+    native/compat strategy selector is never short-circuited by a pre-injected
+    class-level method.
+    """
+
     patch_verl_bucketed_weight_transfer_rebuild_ipc()
     patch_verl_bucketed_weight_transfer_shm_reuse()
-    try:
-        from verl.workers.rollout.vllm_rollout import vllm_rollout
-    except Exception:  # noqa: BLE001
-        return
-
-    server_adapter = getattr(vllm_rollout, "ServerAdapter", None)
-    if server_adapter is not None and not callable(
-        getattr(server_adapter, "update_draft_weights", None)
-    ):
-        server_adapter.update_draft_weights = speco_vllm_update_draft_weights
 
 
 def install_vllm_runtime_for_worker(worker: Any) -> None:

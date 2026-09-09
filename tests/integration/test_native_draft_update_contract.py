@@ -84,6 +84,58 @@ def test_stock_verl_rollout_adapter_lacks_native_draft_update_api() -> None:
     assert ndu.native_draft_update_available(adapter) is False
 
 
+def test_patch_vllm_server_adapter_update_does_not_inject_update_draft_weights(
+    monkeypatch,
+) -> None:
+    """Production init must not pre-inject compat ``update_draft_weights`` on
+    the ``ServerAdapter`` class.  Otherwise ``attach_draft_weight_updater``'s
+    early-return guard would short-circuit ``select_draft_update_strategy``,
+    making the native/compat selector and its startup log dead code.
+    """
+    pytest.importorskip("verl", reason="needs verl ServerAdapter")
+    from verl.workers.rollout.vllm_rollout import vllm_rollout as vllm_rollout_mod
+
+    from verl_speco.integration.vllm_runtime import patch_vllm_server_adapter_update
+
+    ServerAdapter = getattr(vllm_rollout_mod, "ServerAdapter", None)
+    if ServerAdapter is None:
+        pytest.skip("ServerAdapter not importable")
+    # Clean any pre-existing method from prior test runs / imports.
+    if hasattr(ServerAdapter, "update_draft_weights"):
+        monkeypatch.delattr(ServerAdapter, "update_draft_weights")
+
+    patch_vllm_server_adapter_update()
+
+    assert not callable(
+        getattr(ServerAdapter, "update_draft_weights", None)
+    ), "patch_vllm_server_adapter_update must NOT inject update_draft_weights"
+
+
+def test_production_attach_after_init_selects_compat_on_stock_adapter(
+    monkeypatch, caplog
+) -> None:
+    """After production init (IPC patches only, no compat pre-injection),
+    ``attach_draft_weight_updater`` on a stock adapter must run the strategy
+    selector, log the decision, and bind the compat method."""
+    pytest.importorskip("verl", reason="needs verl ServerAdapter")
+    from verl.workers.rollout.vllm_rollout.vllm_rollout import ServerAdapter
+
+    from verl_speco.integration import native_draft_update as ndu_mod
+
+    compat_calls: list = []
+    monkeypatch.setattr(ndu_mod, "_default_compat_attacher", lambda r: compat_calls.append(r))
+
+    caplog.set_level("WARNING", logger="verl_speco.integration.native_draft_update")
+    adapter = ServerAdapter.__new__(ServerAdapter)
+
+    ndu_mod.attach_draft_weight_updater({"speco": {"runtime": {"weight_update_mode": "auto"}}}, adapter)
+
+    # The selector ran (not short-circuited by a pre-injected method).
+    assert len(compat_calls) == 1
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("backend=" in m and "path=compat" in m for m in messages)
+
+
 def test_select_compat_mode_forces_compat_path() -> None:
     decision = ndu.select_draft_update_strategy(
         _config("compat"), _full_native_rollout()
