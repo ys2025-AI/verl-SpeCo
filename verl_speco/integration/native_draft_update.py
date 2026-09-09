@@ -158,7 +158,13 @@ def native_draft_update_available(rollout: Any, backend: Optional[str] = None) -
     has_update = callable(getattr(rollout, "update_weights", None))
     has_server_api = _server_supports_draft_update(rollout)
     supports_engine = _worker_reports_draft_weight_support(rollout)
-    return has_client_api and has_finish and has_update and has_server_api and supports_engine
+    return (
+        has_client_api
+        and has_finish
+        and has_update
+        and has_server_api
+        and supports_engine
+    )
 
 
 def ascend_native_draft_update_available(rollout: Any) -> bool:
@@ -293,7 +299,9 @@ class NativeVLLMDraftWeightSyncClient:
         self.rollout = rollout
         self.decision = decision
 
-    async def update(self, weights: Any, *args, global_steps: int | None = None, **kwargs) -> None:
+    async def update(
+        self, weights: Any, *args, global_steps: int | None = None, **kwargs
+    ) -> None:
         del args, kwargs
         if not weights:
             return
