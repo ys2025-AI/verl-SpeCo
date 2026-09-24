@@ -67,6 +67,9 @@ _PRODUCER_HIDDEN_DTYPE_KEY = "speco.standalone_tq_producer.hidden_dtype"
 _DSPARK_L1_LOSS_ALPHA_KEY = (
     "actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha"
 )
+_DSPARK_CONFIDENCE_LOSS_ALPHA_KEY = (
+    "actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha"
+)
 _ALGORITHM_TARGET_LAYER_IDS_KEYS = {
     "DFLASH": "actor_rollout_ref.rollout.drafter.training.dflash_target_layer_ids",
     "DSPARK": "actor_rollout_ref.rollout.drafter.training.dspark_target_layer_ids",
@@ -727,9 +730,17 @@ def build_pipeline_commands(
     dspark_l1_loss_alpha = float(
         _strip_quotes(_find_override(training_args, _DSPARK_L1_LOSS_ALPHA_KEY) or "0.9")
     )
+    dspark_confidence_loss_alpha = float(
+        _strip_quotes(
+            _find_override(training_args, _DSPARK_CONFIDENCE_LOSS_ALPHA_KEY) or "0.0"
+        )
+    )
     hidden_layout = resolve_drafter_hidden_states_layout(
         config.algorithm,
-        {"dspark_l1_loss_alpha": dspark_l1_loss_alpha},
+        {
+            "dspark_l1_loss_alpha": dspark_l1_loss_alpha,
+            "dspark_confidence_loss_alpha": dspark_confidence_loss_alpha,
+        },
     )
     consumer_internal.extend(
         [

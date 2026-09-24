@@ -95,13 +95,21 @@ class DSparkTrainingModel(DFlashTrainingModel):
             )
         self._logged_distribution_loss_backend: Optional[str] = None
         self._distribution_loss_by_device: dict[str, bool] = {}
-        if self.confidence_head_alpha > 0:
-            raise NotImplementedError(
-                "DSpark confidence loss needs target acceptance targets from target logits; "
-                "set dspark_confidence_loss_alpha=0 for the current CE-only trainer path."
-            )
         confidence_head = getattr(self.draft_model, "confidence_head", None)
-        if confidence_head is not None:
+        self.confidence_loss_enabled = self.confidence_head_alpha > 0
+        if self.confidence_loss_enabled:
+            if confidence_head is None:
+                raise ValueError(
+                    "DSpark confidence loss is enabled but the draft model has no "
+                    "confidence head; set dspark_confidence_head_alpha>0 or load a "
+                    "checkpoint that carries one."
+                )
+            confidence_head.requires_grad_(True)
+            logger.info(
+                "[dspark-trainer] confidence head is trainable (alpha=%.4f)",
+                self.confidence_head_alpha,
+            )
+        elif confidence_head is not None:
             confidence_head.requires_grad_(False)
             logger.info(
                 "[dspark-trainer] confidence head is loaded but frozen because confidence loss is disabled"
@@ -415,6 +423,70 @@ class DSparkTrainingModel(DFlashTrainingModel):
             l1_sum = l1_sum + (l1_per_token * weights_chunk).sum()
         return l1_sum, l1_den
 
+    def _compute_confidence_loss_for_active(
+        self,
+        *,
+        active_hidden: torch.Tensor,
+        active_prev_tokens: torch.Tensor,
+        active_target_hidden: torch.Tensor,
+        active_weights: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Train the DSpark confidence head to predict per-position acceptance.
+
+        The target is the analytical rejection-sampling acceptance rate
+        ``alpha = sum_v min(p_v, q_v) = 1 - d_TV`` between the target (verifier)
+        and draft distributions, mirroring ``speculators``' DSpark confidence
+        head. Only the confidence head receives gradients; the target uses the
+        frozen full-vocab distributions and is detached.
+        """
+        if active_hidden.numel() == 0:
+            zero = active_weights.new_zeros(())
+            return zero, zero, zero, zero
+
+        conf_sum = active_weights.new_zeros((), dtype=torch.float32)
+        conf_den = active_weights.float().sum()
+        accept_sum = active_weights.new_zeros((), dtype=torch.float32)
+        pred_sum = active_weights.new_zeros((), dtype=torch.float32)
+        active_count = int(active_hidden.size(0))
+        chunk_size = self.l1_chunk_size if self.l1_chunk_size > 0 else active_count
+        for start in range(0, active_count, chunk_size):
+            end = min(start + chunk_size, active_count)
+            hidden_chunk = active_hidden[start:end]
+            prev_chunk = active_prev_tokens[start:end]
+            target_hidden_chunk = active_target_hidden[start:end]
+            weights_chunk = active_weights[start:end].float()
+
+            confidence_logits = self.draft_model.predict_confidence(
+                hidden_chunk, prev_token_ids=prev_chunk
+            )
+            if confidence_logits is None:
+                zero = active_weights.new_zeros(())
+                return zero, zero, zero, zero
+            with torch.no_grad():
+                draft_logits = F.linear(hidden_chunk, lm_head_weight)
+                markov_bias = self._markov_bias_for_active(
+                    active_hidden=hidden_chunk,
+                    active_prev_tokens=prev_chunk,
+                    restricted_vocab=None,
+                )
+                if markov_bias is not None:
+                    draft_logits = draft_logits + markov_bias
+                draft_probs = torch.softmax(draft_logits.float(), dim=-1)
+                target_logits = F.linear(target_hidden_chunk, lm_head_weight)
+                target_probs = torch.softmax(target_logits.float(), dim=-1)
+                accept_rate = torch.minimum(draft_probs, target_probs).sum(dim=-1)
+            bce = F.binary_cross_entropy_with_logits(
+                confidence_logits, accept_rate, reduction="none"
+            )
+            conf_sum = conf_sum + (bce * weights_chunk).sum()
+            accept_sum = accept_sum + (accept_rate * weights_chunk).sum()
+            pred_sum = (
+                pred_sum
+                + (confidence_logits.detach().float().sigmoid() * weights_chunk).sum()
+            )
+        return conf_sum, conf_den, accept_sum, pred_sum
+
     def _should_debug_log(self) -> bool:
         if not self.debug_log:
             return False
@@ -563,6 +635,10 @@ class DSparkTrainingModel(DFlashTrainingModel):
         local_ce_den = torch.zeros((), dtype=torch.float32, device=device)
         local_l1_sum = torch.zeros((), dtype=torch.float32, device=device)
         local_l1_den = torch.zeros((), dtype=torch.float32, device=device)
+        local_conf_sum = torch.zeros((), dtype=torch.float32, device=device)
+        local_conf_den = torch.zeros((), dtype=torch.float32, device=device)
+        confidence_accept_sum = torch.zeros((), dtype=torch.float32, device=device)
+        confidence_pred_sum = torch.zeros((), dtype=torch.float32, device=device)
         active_logits = None
         active_log_probs = None
         restricted_vocab = None
@@ -688,7 +764,35 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 l1_loss = local_l1_sum / local_l1_den.clamp(min=1e-6)
             else:
                 l1_loss = local_ploss_sum.new_zeros(())
-            loss = (ce_loss * self.ce_loss_alpha) + (l1_loss * self.l1_loss_alpha)
+            confidence_loss = local_ploss_sum.new_zeros(())
+            if self.confidence_loss_enabled:
+                if active_target_hidden is None:
+                    raise ValueError(
+                        "DSpark confidence loss requires target_last_hidden_states. "
+                        "Enable old-logprob dflash_aux_plus_last collection or set "
+                        "dspark_confidence_loss_alpha=0."
+                    )
+                finite_target_hidden = torch.isfinite(active_target_hidden).all(dim=-1)
+                confidence_mask = finite_loss & finite_target_hidden
+                if confidence_mask.any():
+                    (
+                        local_conf_sum,
+                        local_conf_den,
+                        confidence_accept_sum,
+                        confidence_pred_sum,
+                    ) = self._compute_confidence_loss_for_active(
+                        active_hidden=active_hidden[confidence_mask],
+                        active_prev_tokens=active_prev_tokens[confidence_mask],
+                        active_target_hidden=active_target_hidden[confidence_mask],
+                        active_weights=active_loss_weights[confidence_mask],
+                        lm_head_weight=lm_head_weight,
+                    )
+                confidence_loss = local_conf_sum / local_conf_den.clamp(min=1e-6)
+            loss = (
+                (ce_loss * self.ce_loss_alpha)
+                + (l1_loss * self.l1_loss_alpha)
+                + (confidence_loss * self.confidence_head_alpha)
+            )
 
         with torch.no_grad():
             flat_eval_mask = eval_mask.reshape(-1)
@@ -778,6 +882,10 @@ class DSparkTrainingModel(DFlashTrainingModel):
             "ce_weighted_token_count": local_ce_den.detach(),
             "l1_loss_sum": local_l1_sum.detach(),
             "l1_weighted_token_count": local_l1_den.detach(),
+            "confidence_loss_sum": local_conf_sum.detach(),
+            "confidence_weighted_token_count": local_conf_den.detach(),
+            "confidence_accept_rate_sum": confidence_accept_sum.detach(),
+            "confidence_pred_mean_sum": confidence_pred_sum.detach(),
             "sanitized_rows": sanitized_rows.detach(),
             "masked_rows": (~binary_eval_mask & flat_eval_mask).float().sum().detach(),
             "sampled_vocab_size": sampled_vocab_size.detach(),
@@ -903,6 +1011,12 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             target_layer_ids = build_target_layer_ids(
                 num_context_layers, target_num_hidden_layers
             )
+        confidence_head_alpha = float(
+            training_cfg.get("dspark_confidence_head_alpha", 0.0)
+        )
+        confidence_loss_alpha = float(
+            training_cfg.get("dspark_confidence_loss_alpha", 0.0)
+        )
         intermediate_size_cfg = self._training_value(
             training_cfg, "dspark_intermediate_size", "dflash_intermediate_size", None
         )
@@ -953,8 +1067,9 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             markov_head_type=str(
                 training_cfg.get("dspark_markov_head_type", "vanilla")
             ),
-            confidence_head_alpha=float(
-                training_cfg.get("dspark_confidence_head_alpha", 0.0)
+            confidence_head_alpha=confidence_head_alpha,
+            enable_confidence_head=bool(
+                confidence_head_alpha > 0.0 or confidence_loss_alpha > 0.0
             ),
             confidence_head_with_markov=bool(
                 training_cfg.get("dspark_confidence_head_with_markov", True)
@@ -990,6 +1105,31 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
         drafter_config = self._normalize_dflash_config(
             drafter_config, target_hf_config, normalized_state, spec_model_path
         )
+
+        training_cfg = self.config.rollout.drafter.training
+        confidence_head_alpha = float(
+            training_cfg.get("dspark_confidence_head_alpha", 0.0)
+        )
+        confidence_loss_alpha = float(
+            training_cfg.get("dspark_confidence_loss_alpha", 0.0)
+        )
+        if (confidence_head_alpha > 0.0 or confidence_loss_alpha > 0.0) and not getattr(
+            drafter_config, "enable_confidence_head", False
+        ):
+            # A pretrained checkpoint without a confidence head can still be
+            # fine-tuned with one; the loader leaves the new head at its
+            # initialization (strict=False).
+            drafter_config.enable_confidence_head = True
+            drafter_config.confidence_head_alpha = max(
+                float(getattr(drafter_config, "confidence_head_alpha", 0.0)),
+                confidence_head_alpha,
+            )
+            logger.info(
+                "[dspark-trainer] enabling a fresh confidence head for training "
+                "(head_alpha=%.4f loss_alpha=%.4f)",
+                confidence_head_alpha,
+                confidence_loss_alpha,
+            )
 
         if (
             spec_model_path

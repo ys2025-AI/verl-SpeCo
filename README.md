@@ -140,7 +140,11 @@ DFlash compatibility patches.
 This integration deliberately supports fixed verification length only. Native
 MRV2 does not expose the MRV1 confidence-head/dynamic-length contract, so keep
 `dspark_confidence_loss_alpha=0`, do not publish confidence-head tensors, and
-do not enable dynamic verification length. The Qwen checkpoint must declare
+do not enable dynamic verification length. The MRV1 vLLM path and the standalone
+trainer do support confidence-head training: set `dspark_confidence_loss_alpha>0`
+(optionally `dspark_confidence_head_with_markov`) to train the per-position
+acceptance head against `alpha = sum_v min(p_v, q_v) = 1 - TV`, matching
+`speculators`. The Qwen checkpoint must declare
 `architectures=["Qwen3DSparkModel"]` and use `sample_from_anchor=true` (or omit
 it for the native default); the fixed verification length must not exceed the
 checkpoint's training `block_size`.
@@ -368,6 +372,18 @@ The main mode values are:
 
 Offline training supports every drafter family the online workers support:
 EAGLE-1, EAGLE-2, EAGLE-3, DFlash, DSpark, Domino and P-EAGLE.
+
+DSpark offline training can additionally train the confidence head used for
+dynamic draft-length thresholding. Set `dspark_confidence_loss_alpha>0` (for
+example `0.2`) and the head is created automatically from the target's final
+hidden state; `dspark_confidence_head_with_markov` keeps the Markov previous-token
+embedding in the head input (default `true`). A positive value on either
+`dspark_confidence_head_alpha` or `dspark_confidence_loss_alpha` enables the head,
+while only `dspark_confidence_loss_alpha` weights its BCE term. Training the
+confidence head requires the target's final hidden state, so the DSpark hidden
+state collection switches to `dflash_aux_plus_last` whenever either it or the L1
+loss is enabled. The standalone scripts expose `DSPARK_CONFIDENCE_HEAD_ALPHA`,
+`DSPARK_CONFIDENCE_HEAD_WITH_MARKOV`, and `DSPARK_CONFIDENCE_LOSS_ALPHA`.
 
 Domino and P-EAGLE are training-time families with no engine-level speculative
 method of their own (engines serve Domino as a DFlash projector sub-mode, and

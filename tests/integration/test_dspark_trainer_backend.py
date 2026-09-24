@@ -108,6 +108,8 @@ def _small_dspark_training_model(
     l1_chunk_size: int = 0,
     loss_mode: str = "full_vocab",
     distribution_loss_impl: str = "auto",
+    enable_confidence_head: bool = False,
+    confidence_head_alpha: float = 0.0,
 ):
     config = DSparkConfig(
         hidden_size=8,
@@ -126,6 +128,7 @@ def _small_dspark_training_model(
         num_anchors=2,
         markov_rank=4,
         markov_head_type="vanilla",
+        enable_confidence_head=enable_confidence_head,
     )
     draft_model = DSparkDraftModel(config)
     return DSparkTrainingModel(
@@ -136,6 +139,7 @@ def _small_dspark_training_model(
         l1_loss_alpha=l1_loss_alpha,
         l1_chunk_size=l1_chunk_size,
         distribution_loss_impl=distribution_loss_impl,
+        confidence_head_alpha=confidence_head_alpha,
     )
 
 
@@ -276,6 +280,92 @@ def test_dspark_untrained_confidence_head_is_kept_but_excluded_from_optimizer():
     assert optimizer_parameter_ids.isdisjoint(
         id(parameter) for parameter in confidence_head.parameters()
     )
+
+
+def test_dspark_confidence_loss_without_a_head_is_rejected():
+    config = DSparkConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        vocab_size=32,
+        num_target_layers=4,
+        num_context_layers=2,
+        target_hidden_size=8,
+        target_num_hidden_layers=4,
+        target_layer_ids=[1, 3],
+        mask_token_id=31,
+        markov_rank=4,
+        enable_confidence_head=False,
+    )
+
+    with pytest.raises(ValueError, match="confidence head"):
+        DSparkTrainingModel(
+            draft_model=DSparkDraftModel(config),
+            confidence_head_alpha=0.5,
+        )
+
+
+def test_dspark_confidence_head_trains_against_acceptance_rate():
+    model = _small_dspark_training_model(
+        block_size=2,
+        l1_loss_alpha=0.0,
+        enable_confidence_head=True,
+        confidence_head_alpha=0.5,
+    )
+    confidence_head = model.draft_model.confidence_head
+    assert confidence_head is not None
+    assert all(parameter.requires_grad for parameter in confidence_head.parameters())
+
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    hidden_states = [torch.randn(1, 5, 8), torch.randn(1, 5, 8)]
+    target_last_hidden_states = torch.randn(1, 5, 8)
+    lm_head_weight = torch.randn(32, 8)
+
+    loss, *_rest, diagnostics = model(
+        input_ids=input_ids,
+        hidden_states_list=hidden_states,
+        loss_mask=loss_mask,
+        lm_head_weight=lm_head_weight,
+        target_last_hidden_states=target_last_hidden_states,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert diagnostics["confidence_weighted_token_count"].item() > 0
+    assert diagnostics["confidence_loss_sum"].item() >= 0
+    accept_rate = (
+        diagnostics["confidence_accept_rate_sum"]
+        / diagnostics["confidence_weighted_token_count"]
+    )
+    assert 0.0 <= float(accept_rate) <= 1.0
+    assert any(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in confidence_head.parameters()
+    )
+
+
+def test_dspark_confidence_loss_uses_target_last_hidden_states_without_l1():
+    model = _small_dspark_training_model(
+        block_size=2,
+        l1_loss_alpha=0.0,
+        enable_confidence_head=True,
+        confidence_head_alpha=0.5,
+    )
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    hidden_states = [torch.randn(1, 5, 8), torch.randn(1, 5, 8)]
+
+    with pytest.raises(ValueError, match="target_last_hidden_states"):
+        model(
+            input_ids=input_ids,
+            hidden_states_list=hidden_states,
+            loss_mask=loss_mask,
+            lm_head_weight=torch.randn(32, 8),
+            target_last_hidden_states=None,
+        )
 
 
 def test_dspark_label_and_prev_token_alignment():
