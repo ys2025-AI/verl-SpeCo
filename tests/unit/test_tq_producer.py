@@ -236,6 +236,18 @@ class _OneMisalignedPool(_Pool):
         return raw
 
 
+class _OneFailingPrefillPool(_Pool):
+    def __init__(self, root: Path):
+        super().__init__(root)
+        self.fail_remaining = 1
+
+    async def prefill(self, request: Any) -> RawVllmFeature:
+        if self.fail_remaining:
+            self.fail_remaining -= 1
+            raise RuntimeError("vLLM request failed after 4 attempts")
+        return await super().prefill(request)
+
+
 class _AlwaysMisalignedPool(_Pool):
     async def prefill(self, request: Any) -> RawVllmFeature:
         raw = await super().prefill(request)
@@ -479,10 +491,12 @@ def test_run_producer_generates_response_for_verl_chat_prompt(tmp_path: Path) ->
     )
     transport = _Transport()
     pool = _Pool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["on_missing_response"] = "generate"
 
     stats = asyncio.run(
         run_producer(
-            _config(input_path),
+            config,
             transport=transport,
             tokenizer=_ChatTokenizer(),
             client_pool=pool,
@@ -503,6 +517,32 @@ def test_run_producer_generates_response_for_verl_chat_prompt(tmp_path: Path) ->
     assert fields["sample__loss_mask"].tolist() == [0.0, 1.0]
 
 
+def test_run_producer_skips_rows_without_response_by_default(tmp_path: Path) -> None:
+    """Prompt-only rows are filtered (not generated) unless opted in."""
+
+    input_path = tmp_path / "prompt_only.jsonl"
+    input_path.write_text(
+        json.dumps({"prompt": [{"role": "user", "content": "Q3"}]}) + "\n",
+        encoding="utf-8",
+    )
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+
+    stats = asyncio.run(
+        run_producer(
+            _config(input_path),
+            transport=transport,
+            tokenizer=_ChatTokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    assert stats.filtered_count == 1
+    assert stats.published_count == 0
+    assert pool.generate_calls == 0
+    assert pool.closed and transport.closed
+
+
 def test_run_producer_bounds_consecutive_generated_filters(tmp_path: Path) -> None:
     """A target that always generates untrainable samples must abort, not loop."""
 
@@ -514,6 +554,7 @@ def test_run_producer_bounds_consecutive_generated_filters(tmp_path: Path) -> No
     transport = _Transport()
     pool = _Pool(tmp_path)
     config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["on_missing_response"] = "generate"
     config["speco"]["standalone_tq_producer"]["max_samples"] = 2
     config["speco"]["standalone_tq_producer"]["max_inflight_requests"] = 1
     # No generated completion can reach this many supervised tokens, so every
@@ -620,6 +661,73 @@ def test_run_producer_replaces_misaligned_sample_before_eos(
     assert eos["total_samples"] == 2
     assert all(not path.exists() for path in pool.paths)
     assert pool.closed and transport.closed
+
+
+def test_run_producer_replaces_sample_after_terminal_request_failure(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    transport = _Transport()
+    pool = _OneFailingPrefillPool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    sample_tags = [
+        tag
+        for tag in transport.records.values()
+        if tag.get("record_type") == "sample"
+    ]
+    eos = next(tag for tag in transport.records.values() if tag.get("status") == "eos")
+    assert stats.input_count == 3
+    assert stats.published_count == 2
+    assert stats.request_failed_count == 1
+    assert stats.failed_count == 0
+    assert len(sample_tags) == 2
+    assert eos["total_samples"] == 2
+    assert all(not path.exists() for path in pool.paths)
+    assert pool.closed and transport.closed
+    assert "dropped sample after vLLM prefill failure" in caplog.text
+
+
+def test_run_producer_filters_over_length_sample_without_aborting(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+    config = _config(input_path)
+    # Any sample whose vLLM prefill would exceed this cap must be skipped
+    # instead of aborting the producer.
+    config["speco"]["standalone_tq_producer"]["max_sequence_length"] = 2
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    assert stats.filtered_count == 2
+    assert stats.published_count == 0
+    assert stats.failed_count == 0
+    assert pool.prefill_calls == 0
+    assert pool.closed and transport.closed
+    assert "exceeding max_sequence_length=2" in caplog.text
 
 
 @pytest.mark.parametrize(

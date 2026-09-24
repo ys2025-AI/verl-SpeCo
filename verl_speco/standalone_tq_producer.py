@@ -83,6 +83,7 @@ class ProducerStats:
     failed_count: int = 0
     dropped_count: int = 0
     filtered_count: int = 0
+    request_failed_count: int = 0
     pending_bytes: int = 0
 
 
@@ -320,13 +321,14 @@ async def run_producer(
                 )[:3]
                 logger.info(
                     "Standalone TQ Producer heartbeat state=%s inputs=%s "
-                    "published=%s dropped=%s input_rate=%.2f/s publish_rate=%.2f/s "
-                    "input_queue=%s/%s publish_queue=%s/%s pending_bytes=%s "
-                    "seconds_since_publish=%.0f stages=%s oldest=%s",
+                    "published=%s dropped=%s request_failed=%s input_rate=%.2f/s "
+                    "publish_rate=%.2f/s input_queue=%s/%s publish_queue=%s/%s "
+                    "pending_bytes=%s seconds_since_publish=%.0f stages=%s oldest=%s",
                     get_runtime_state() if get_runtime_state is not None else "running",
                     stats.input_count,
                     stats.published_count,
                     stats.dropped_count,
+                    stats.request_failed_count,
                     (stats.input_count - last_inputs) / elapsed,
                     (stats.published_count - last_published) / elapsed,
                     input_queue.qsize(),
@@ -395,6 +397,21 @@ async def run_producer(
                     )
                     try:
                         if record.response is None:
+                            on_missing = str(
+                                producer_cfg.get("on_missing_response", "skip")
+                                or "skip"
+                            ).lower()
+                            if on_missing == "skip":
+                                raise SampleFilteredError(
+                                    f"Producer sample {record.sample_id!r} has no "
+                                    "assistant response; skipping "
+                                    "(on_missing_response=skip)"
+                                )
+                            if on_missing != "generate":
+                                raise ValueError(
+                                    "on_missing_response must be 'skip' or "
+                                    f"'generate', got {on_missing!r}"
+                                )
                             request = prepare_generation_request(
                                 record, tokenizer, producer_cfg
                             )
@@ -498,6 +515,39 @@ async def run_producer(
             )
             stages.pop("input", None)
 
+        async def fail_and_replace(
+            request: Any, exc: BaseException, *, stage: str
+        ) -> Any:
+            """Drop a sample whose vLLM request failed terminally and pick a replacement.
+
+            The client pool already retries transient errors with endpoint failover;
+            reaching here means those retries were exhausted. Skipping the sample
+            keeps the producer (and therefore training) alive instead of tearing
+            down the whole run over a single unrecoverable request.
+            """
+            stats.request_failed_count += 1
+            logger.error(
+                "Standalone TQ Producer dropped sample after vLLM %s failure "
+                "sequence_no=%s sample_id=%s failed=%s reason=%s",
+                stage,
+                request.sequence_no,
+                request.sample_id,
+                stats.request_failed_count,
+                exc,
+            )
+            if max_samples <= 0:
+                return None
+            replacement = await next_request_async()
+            if replacement is _INPUT_DONE:
+                return None
+            logger.info(
+                "Standalone TQ Producer replacing failed sample with "
+                "sequence_no=%s sample_id=%s",
+                replacement.sequence_no,
+                replacement.sample_id,
+            )
+            return replacement
+
         async def request_worker() -> None:
             current = asyncio.current_task()
             worker = current.get_name() if current is not None else "request-unknown"
@@ -546,7 +596,13 @@ async def run_producer(
                     )
                 if isinstance(request, GenerationRequest):
                     mark_stage(worker, "vllm_generate", request.sample_id)
-                    generated = await pool.generate(request)
+                    try:
+                        generated = await pool.generate(request)
+                    except Exception as exc:  # noqa: BLE001 - keep the producer alive
+                        replacement_request = await fail_and_replace(
+                            request, exc, stage="generate"
+                        )
+                        continue
                     try:
                         try:
                             request = prepare_generated_prefill_request(
@@ -590,10 +646,22 @@ async def run_producer(
                         # following full-sequence prefill produces that payload.
                         await asyncio.to_thread(delete_temporary_result, generated)
                     mark_stage(worker, "vllm_prefill", request.sample_id)
-                    raw = await pool.prefill(request)
+                    try:
+                        raw = await pool.prefill(request)
+                    except Exception as exc:  # noqa: BLE001 - keep the producer alive
+                        replacement_request = await fail_and_replace(
+                            request, exc, stage="prefill"
+                        )
+                        continue
                 else:
                     mark_stage(worker, "vllm_prefill", request.sample_id)
-                    raw = await pool.prefill(request)
+                    try:
+                        raw = await pool.prefill(request)
+                    except Exception as exc:  # noqa: BLE001 - keep the producer alive
+                        replacement_request = await fail_and_replace(
+                            request, exc, stage="prefill"
+                        )
+                        continue
                 stats.pending_bytes += int(raw.byte_size)
                 try:
                     mark_stage(worker, "feature_conversion", request.sample_id)
@@ -751,10 +819,11 @@ async def run_producer(
         completed = True
         logger.info(
             "Standalone TQ Producer completed inputs=%s published=%s dropped=%s "
-            "failed=%s elapsed=%.3fs average_rate=%.2f/s",
+            "request_failed=%s failed=%s elapsed=%.3fs average_rate=%.2f/s",
             stats.input_count,
             stats.published_count,
             stats.dropped_count,
+            stats.request_failed_count,
             stats.failed_count,
             time.monotonic() - producer_started_at,
             stats.published_count / max(time.monotonic() - producer_started_at, 1e-9),
