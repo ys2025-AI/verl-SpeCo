@@ -25,6 +25,7 @@ from omegaconf import OmegaConf  # noqa: E402
 
 from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _build_backend,
+    _build_standalone_tracking,
     _clear_tq_batch_across_ranks,
     _connect_tq_store_across_ranks,
     _contains_replay_samples,
@@ -163,6 +164,35 @@ def test_contains_replay_samples_detects_draft_replay_sample():
 
     assert _contains_replay_samples([sample])
     assert not _contains_replay_samples([{"input_ids": [1, 2]}])
+
+
+def test_standalone_tracking_only_enables_tensorboard_on_rank_zero(monkeypatch):
+    import verl.utils.tracking as tracking_module
+
+    created = []
+
+    class _FakeTracking:
+        def __init__(self, project_name, experiment_name, default_backend):
+            created.append((project_name, experiment_name, list(default_backend)))
+
+    monkeypatch.setattr(tracking_module, "Tracking", _FakeTracking)
+    config = OmegaConf.create(
+        {
+            "trainer": {
+                "logger": ["console", "tensorboard"],
+                "project_name": "proj",
+                "experiment_name": "exp",
+            }
+        }
+    )
+
+    tracker = _build_standalone_tracking(config, rank=0)
+    assert isinstance(tracker, _FakeTracking)
+    assert created == [("proj", "exp", ["tensorboard"])]
+    assert _build_standalone_tracking(config, rank=1) is None
+
+    wandb_only = OmegaConf.create({"trainer": {"logger": ["console", "wandb"]}})
+    assert _build_standalone_tracking(wandb_only, rank=0) is None
 
 
 @pytest.mark.parametrize(

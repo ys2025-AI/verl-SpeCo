@@ -70,6 +70,64 @@ def _contains_replay_samples(samples: list[Any]) -> bool:
     return any(isinstance(sample, DraftReplaySample) for sample in samples)
 
 
+def _standalone_tracking_backends(config: Any) -> list[str]:
+    trainer_cfg = getattr(config, "trainer", None)
+    if trainer_cfg is None and isinstance(config, dict):
+        trainer_cfg = config.get("trainer")
+    if trainer_cfg is None:
+        return []
+    backends = getattr(trainer_cfg, "logger", None)
+    if backends is None and isinstance(trainer_cfg, dict):
+        backends = trainer_cfg.get("logger")
+    if backends is None:
+        return []
+    if isinstance(backends, str):
+        backends = [backends]
+    return [str(backend).strip().lower() for backend in backends]
+
+
+def _build_standalone_tracking(config: Any, *, rank: int) -> Any:
+    """Create a TensorBoard tracker on rank 0 when it is requested via `trainer.logger`."""
+
+    if rank != 0 or "tensorboard" not in _standalone_tracking_backends(config):
+        return None
+    trainer_cfg = getattr(config, "trainer", None)
+    if trainer_cfg is None and isinstance(config, dict):
+        trainer_cfg = config.get("trainer")
+    project_name = getattr(trainer_cfg, "project_name", None)
+    if project_name is None and isinstance(trainer_cfg, dict):
+        project_name = trainer_cfg.get("project_name")
+    experiment_name = getattr(trainer_cfg, "experiment_name", None)
+    if experiment_name is None and isinstance(trainer_cfg, dict):
+        experiment_name = trainer_cfg.get("experiment_name")
+    try:
+        from verl.utils.tracking import Tracking
+
+        return Tracking(
+            project_name=str(project_name or "verl_dspark_drafter"),
+            experiment_name=str(experiment_name or "standalone_draft"),
+            default_backend=["tensorboard"],
+        )
+    except Exception:
+        logger.exception(
+            "[standalone rank=%s] failed to initialize tensorboard tracking", rank
+        )
+        return None
+
+
+def _log_standalone_tracking_metrics(
+    tracking: Any, metrics: dict[str, float], *, step: int
+) -> None:
+    if tracking is None:
+        return
+    try:
+        tracking.log(data=dict(metrics), step=int(step))
+    except Exception:
+        logger.exception(
+            "[standalone] failed to write tensorboard metrics at step=%s", step
+        )
+
+
 def run_standalone_draft_training(config) -> dict[str, Any]:
     """Run independent draft training from a feature store."""
     return asyncio.run(_run_standalone_draft_training_async(config))
@@ -82,6 +140,7 @@ async def _run_standalone_draft_training_async(
     training_events: Any | None = None,
 ) -> dict[str, Any]:
     rank, local_rank, world_size = _init_distributed()
+    standalone_tracking = _build_standalone_tracking(config, rank=rank)
     logger.info(
         "[standalone rank=%s] distributed runtime initialized local_rank=%s world_size=%s",
         rank,
@@ -533,6 +592,9 @@ async def _run_standalone_draft_training_async(
             if feature_producer is not None:
                 step_metrics.update(feature_producer.metrics())
             _log_standalone_step_metrics(step_metrics, rank=rank)
+            _log_standalone_tracking_metrics(
+                standalone_tracking, step_metrics, step=optimizer_step
+            )
             if save_interval > 0 and optimizer_step % save_interval == 0:
                 current_stage = "save_checkpoint"
                 checkpoint_started = time.perf_counter()
@@ -600,6 +662,8 @@ async def _run_standalone_draft_training_async(
         )
         raise
     finally:
+        if standalone_tracking is not None:
+            standalone_tracking.finish()
         logger.info(
             "[standalone rank=%s] cleanup starting stage=%s attempted_batches=%s "
             "successful_steps=%s",
