@@ -81,6 +81,16 @@ def test_arbitrary_drafter_backend_passes():
     assert _violations("run_qwen3-8b_drafter_newstrategy_vllm.sh") == []
 
 
+def test_eval_entrypoint_passes():
+    assert _violations("run_qwen3-8b_drafter_dspark_eval_gsm8k.sh") == []
+    assert _violations("run_qwen3-8b_actor_fsdp2_drafter_dspark_eval.sh") == []
+
+
+def test_eval_entrypoint_requires_drafter_backend():
+    errs = _violations("run_qwen3-8b_drafter_eval_gsm8k.sh")
+    assert errs and "non-empty drafter backend before '_eval_'" in errs[0]
+
+
 def test_missing_drafter_marker_rejected():
     errs = _violations("run_qwen3-8b_eagle3_vllm.sh")
     assert errs and "drafter" in errs[0]

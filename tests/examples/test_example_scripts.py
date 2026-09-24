@@ -25,6 +25,7 @@ PPO_EXAMPLES = [
     script
     for script in (ROOT / "examples").glob("*.sh")
     if not script.name.endswith("_separate_training.sh")
+    and "_eval" not in script.name
 ]
 
 

@@ -23,6 +23,10 @@ The standalone/offline draft-training entry point uses:
 
     run_<model>_[actor_<actor-backend>_]drafter_[<drafter-backend>...]_separate_training.sh
 
+The evaluation entry point uses:
+
+    run_<model>_[actor_<actor-backend>_]drafter_<drafter-backend>_eval[_<label>...].sh
+
 Actor and drafter backend identifiers are intentionally not enumerated here.
 This check validates filename structure without duplicating the backend
 registries owned by the implementations.
@@ -70,7 +74,9 @@ def _format_expected() -> str:
         f"rollout-backend in {list(ROLLOUT_BACKENDS)}, or "
         "run_<model>_[actor_<actor-backend>_]drafter_"
         "[<drafter-backend>...]_separate_training.sh with "
-        "zero or more non-empty drafter backend identifiers"
+        "zero or more non-empty drafter backend identifiers, or "
+        "run_<model>_[actor_<actor-backend>_]drafter_"
+        "<drafter-backend>_eval[_<label>...].sh with a non-empty drafter backend"
     )
 
 
@@ -102,6 +108,19 @@ def check_filename(path: Path, display: str | None = None) -> list[str]:
             )
     if not model_tokens:
         errors.append(f"{shown}: model name is missing before '_drafter_'")
+
+    if "eval" in spec_tokens:
+        eval_index = spec_tokens.index("eval")
+        backend_tokens = spec_tokens[:eval_index]
+        label_tokens = spec_tokens[eval_index + 1 :]
+        if not backend_tokens or any(not token for token in backend_tokens):
+            errors.append(
+                f"{shown}: expected a non-empty drafter backend before '_eval_'; "
+                f"{_format_expected()}"
+            )
+        if any(not token for token in label_tokens):
+            errors.append(f"{shown}: expected non-empty eval label tokens after '_eval_'")
+        return errors
 
     if tuple(spec_tokens[-len(STANDALONE_SUFFIX) :]) == STANDALONE_SUFFIX:
         for token in spec_tokens[: -len(STANDALONE_SUFFIX)]:
