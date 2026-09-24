@@ -25,11 +25,11 @@ from verl_speco.backends.dflash_trainer_backend import (
     DFlashTrainerBackend,
     DFlashTrainingModel,
     _block_acceptance_counts,
-    _create_dflash_dense_attention_mask,
-    _create_dflash_mask_mod,
+    _resolve_sliding_windows,
+    _sliding_window_config,
+    build_dflash_attention_masks,
 )
 from verl_speco.models.dflash import resolve_rope_theta
-from verl_speco.models.dflash.flex_attention import compile_friendly_create_block_mask
 from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
 from verl_speco.ops.dspark_fused_loss import (
     fused_label_cross_entropy,
@@ -54,6 +54,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
     - previous tokens are `[x[a], labels[:-1]]`,
     - every supervised position, including position 0, contributes to CE.
     """
+
+    draft_model: DSparkDraftModel
 
     def __init__(
         self,
@@ -133,7 +135,11 @@ class DSparkTrainingModel(DFlashTrainingModel):
         return use_fused
 
     def _sample_anchor_positions(
-        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
+        self,
+        seq_len: int,
+        loss_mask: torch.Tensor,
+        device: torch.device,
+        document_ids: Optional[torch.Tensor] = None,
     ):
         bsz = loss_mask.shape[0]
         num_candidates = max(seq_len - 1, 0)
@@ -149,12 +155,19 @@ class DSparkTrainingModel(DFlashTrainingModel):
         valid = (loss_mask[:, :num_candidates] > 0.5) & (
             loss_mask[:, 1 : num_candidates + 1] > 0.5
         )
-        valid_counts = valid.sum(dim=1)
         indices = (
             self._cached_arange("dspark_anchor_indices", num_candidates, device)
             .unsqueeze(0)
             .expand(bsz, -1)
         )
+        if document_ids is not None:
+            # Keep the whole anchor window inside one document so a block never
+            # spans a packing boundary.
+            docs = document_ids[:, :num_candidates]
+            window_tail = (indices + self.block_size).clamp(max=seq_len - 1)
+            tail_docs = torch.gather(document_ids, 1, window_tail)
+            valid = valid & (docs >= 0) & (docs == tail_docs)
+        valid_counts = valid.sum(dim=1)
         masked_indices = torch.where(valid, indices, seq_len + 1)
         random_vals = torch.rand(bsz, num_candidates, device=device)
         random_vals = torch.where(valid, random_vals, 2.0)
@@ -468,13 +481,14 @@ class DSparkTrainingModel(DFlashTrainingModel):
         loss_mask: torch.Tensor,
         lm_head_weight: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
+        document_ids: Optional[torch.Tensor] = None,
     ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         self._debug_forward_count += 1
         context_feature = self.draft_model.extract_context_feature(hidden_states_list)
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device
+            seq_len, loss_mask, device, document_ids=document_ids
         )
         n_blocks = anchor_positions.shape[1]
         noise_embedding = self._create_noise_embed(
@@ -483,28 +497,15 @@ class DSparkTrainingModel(DFlashTrainingModel):
         context_position_ids, draft_position_ids = self._create_position_ids(
             anchor_positions, seq_len
         )
-        draft_len = n_blocks * self.block_size
-
-        block_mask = None
-        dense_attention_mask = None
-        if device.type == "cuda":
-            block_mask = compile_friendly_create_block_mask(
-                mask_mod=_create_dflash_mask_mod(
-                    anchor_positions, block_keep_mask, seq_len, self.block_size
-                ),
-                B=bsz,
-                H=None,
-                Q_LEN=draft_len,
-                KV_LEN=seq_len + draft_len,
-                device=device,
-            )
-        else:
-            dense_attention_mask = _create_dflash_dense_attention_mask(
-                anchor_positions,
-                block_keep_mask,
-                seq_len,
-                self.block_size,
-            )
+        block_mask, dense_attention_mask = build_dflash_attention_masks(
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            ctx_len=seq_len,
+            block_size=self.block_size,
+            device=device,
+            windows=_resolve_sliding_windows(self.draft_model.config),
+            document_ids=document_ids,
+        )
 
         draft_hidden = self.draft_model(
             draft_input_ids=None,
@@ -910,17 +911,21 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             if intermediate_size_cfg is not None
             else getattr(target_text_config, "intermediate_size", hidden_size * 4)
         )
+        num_hidden_layers = int(
+            self._training_value(
+                training_cfg,
+                "dspark_num_hidden_layers",
+                "dflash_num_hidden_layers",
+                1,
+            )
+        )
+        sliding_window = self._training_value(
+            training_cfg, "dspark_sliding_window", "dflash_sliding_window", None
+        )
         return DSparkConfig(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            num_hidden_layers=int(
-                self._training_value(
-                    training_cfg,
-                    "dspark_num_hidden_layers",
-                    "dflash_num_hidden_layers",
-                    1,
-                )
-            ),
+            num_hidden_layers=num_hidden_layers,
             num_attention_heads=int(getattr(target_text_config, "num_attention_heads")),
             num_key_value_heads=int(
                 getattr(
@@ -956,6 +961,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             ),
             ce_loss_alpha=float(training_cfg.get("dspark_ce_loss_alpha", 0.1)),
             l1_loss_alpha=float(training_cfg.get("dspark_l1_loss_alpha", 0.9)),
+            **_sliding_window_config(sliding_window, num_hidden_layers),
         )
 
     def build_model(self):
@@ -1164,6 +1170,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             loss_mask=batch["loss_mask"],
             lm_head_weight=self.target_lm_head.fc.weight,
             target_last_hidden_states=batch.get("target_last_hidden_states"),
+            document_ids=batch.get("document_ids"),
         )
         local_num_tokens = diagnostics.get("ce_weighted_token_count")
         if not torch.is_tensor(local_num_tokens):
